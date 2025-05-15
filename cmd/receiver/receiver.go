@@ -16,13 +16,17 @@ type MessageLatency struct {
 }
 
 func main() {
-	dialer := websocket.Dialer{
-		ReadBufferSize:  conf.ReadBufferSize,
-		WriteBufferSize: conf.WriteBufferSize,
-	}
+	//dialer := websocket.Dialer{
+	//	ReadBufferSize:  conf.ReadBufferSize,
+	//	WriteBufferSize: conf.WriteBufferSize,
+	//}
 
-	conn, _, _ := dialer.Dial("ws://127.0.0.1:8081/relay", nil)
-	defer conn.Close()
+	ws, _, _ := websocket.DefaultDialer.Dial("ws://localhost:8080/sender", nil)
+	defer func() {
+		if ws != nil {
+			ws.Close()
+		}
+	}()
 
 	messageChan := make(chan MessageLatency, conf.MessageChanSize)
 
@@ -91,13 +95,18 @@ func main() {
 			default:
 				if conf.UseGosched {
 					runtime.Gosched()
-				} 
+				}
 			}
 		}
 	}()
+	
+	ws.WriteMessage(websocket.BinaryMessage, []byte("ready"))
 
 	for {
-		_, msg, err := conn.ReadMessage()
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
 		if err != nil || len(msg) < 8 {
 			continue
 		}

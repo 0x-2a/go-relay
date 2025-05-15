@@ -1,21 +1,19 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"flag"
-	"go-relay/cmd/conf"
-	"log"
-	"math/rand"
-	"net/http"
-	"strconv"
-	"sync"
-	"time"
-
+	"fmt"
 	"github.com/Allenxuxu/gev"
 	"github.com/Allenxuxu/gev/plugins/websocket"
 	"github.com/Allenxuxu/gev/plugins/websocket/ws"
 	"github.com/Allenxuxu/gev/plugins/websocket/ws/util"
+	gws "github.com/gorilla/websocket"
+	"go-relay/cmd/conf"
+	"log"
+	"net/http"
+	"runtime"
+	"strconv"
+	"sync"
 )
 
 var (
@@ -25,7 +23,8 @@ var (
 
 type example struct {
 	sync.Mutex
-	sessions map[*gev.Connection]*Session
+	sessions    map[*gev.Connection]*Session
+	messageChan chan []byte
 }
 
 type Session struct {
@@ -33,9 +32,6 @@ type Session struct {
 	header http.Header
 	conn   *gev.Connection
 }
-
-// connection lifecycle
-// OnConnect() -> OnRequest() -> OnHeader() -> OnMessage() -> OnClose()
 
 func (s *example) OnConnect(c *gev.Connection) {
 	log.Println("OnConnect: ", c.PeerAddr())
@@ -52,31 +48,6 @@ func (s *example) OnConnect(c *gev.Connection) {
 func (s *example) OnMessage(c *gev.Connection, data []byte) (messageType ws.MessageType, out []byte) {
 	log.Println("OnMessage: ", string(data))
 
-	s.Lock()
-	session, ok := s.sessions[c]
-	if !ok {
-		s.Unlock()
-		return
-	}
-	s.Unlock()
-
-	if session.first {
-		session.first = false
-
-		_header, ok := c.Get(keyRequestHeader)
-		if ok {
-			header := _header.(http.Header)
-			session.header = header
-			log.Printf("request header header: %+v \n", header)
-		}
-
-		_uri, ok := c.Get(keyUri)
-		if ok {
-			uri := _uri.(string)
-			log.Printf("request uri: %v \n", uri)
-		}
-	}
-
 	messageType = ws.MessageBinary
 	out = data
 
@@ -92,31 +63,35 @@ func (s *example) OnClose(c *gev.Connection) {
 	delete(s.sessions, c)
 }
 
-func loopBroadcast(serv *example) {
-	messageChan := make(chan []byte, conf.MessageChanSize)
-
-	// Create messages
+func (s *example) ForwardMessages() {
+	// Forward messages from Source to Dest
 	go func() {
-		prng := rand.New(rand.NewSource(conf.RandSeed))
+		// Connect to Source
+		senderWS, _, _ := gws.DefaultDialer.Dial("ws://localhost:8080/sender", nil)
+		defer senderWS.Close()
 
+		if conf.LockOSThread {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+		}
+
+		// Read message, add to channel
 		for {
-			if conf.SenderThrottleMillis > 0 {
-				time.Sleep(conf.SenderThrottleMillis * time.Millisecond)
+			_, msg, err := senderWS.ReadMessage()
+			if err != nil {
+				break
 			}
 
-			//// Generate random payload (2-4096 bytes)
-			length := prng.Intn(conf.PayloadMaxBytes-conf.PayloadMinBytes) + conf.PayloadMinBytes
-			data := make([]byte, length)
-			prng.Read(data)
-
 			select {
-			case messageChan <- data:
+			case s.messageChan <- msg:
+			default:
+				fmt.Println("relay chan full")
 			}
 		}
 	}()
-	
-	time.Sleep(100 * time.Millisecond)
+}
 
+func loopRelay(serv *example) {
 	for {
 		//serv.Lock()
 
@@ -125,31 +100,17 @@ func loopBroadcast(serv *example) {
 				continue
 			}
 
-			if len(messageChan) == 0 {
-				panic("message chan is empty")
+			if len(serv.messageChan) == 0 {
+				continue
 			}
 
-			msgBytes := <-messageChan
+			msgBytes := <-serv.messageChan
 
-			buf := bytes.NewBuffer(make([]byte, 0, conf.TimestampBytes+len(msgBytes)))
-
-			// Prepend timestamp (int64, 8 bytes)
-			binary.Write(buf, binary.BigEndian, time.Now().UnixNano())
-			buf.Write(msgBytes)
-
-			payloadBytes := buf.Bytes()
-
-			msg, err := util.PackData(ws.MessageBinary, payloadBytes)
+			msg, err := util.PackData(ws.MessageBinary, msgBytes)
 			if err != nil {
 				continue
 			}
 			_ = session.conn.Send(msg)
-		}
-
-		//serv.Unlock()
-
-		if conf.SenderThrottleMillis > 0 {
-			time.Sleep(conf.SenderThrottleMillis * time.Millisecond)
 		}
 	}
 }
@@ -166,12 +127,13 @@ func main() {
 		loops int
 	)
 
-	flag.IntVar(&port, "port", 8080, "server port")
+	flag.IntVar(&port, "port", 8081, "server port")
 	flag.IntVar(&loops, "loops", -1, "num loops")
 	flag.Parse()
 
 	handler := &example{
-		sessions: make(map[*gev.Connection]*Session, 10),
+		sessions:    make(map[*gev.Connection]*Session, 10),
+		messageChan: make(chan []byte, conf.MessageChanSize),
 	}
 
 	wsUpgrader := &ws.Upgrader{}
@@ -195,18 +157,18 @@ func main() {
 		log.Println("OnRequest: ", string(uri))
 
 		c.Set(keyUri, string(uri))
+
+		handler.ForwardMessages()
+
 		return nil
 	}
 
-	go loopBroadcast(handler)
+	go loopRelay(handler)
 
-	s, err := NewWebSocketServer(
-		handler,
-		wsUpgrader,
+	s, err := NewWebSocketServer(handler, wsUpgrader,
 		gev.Network("tcp"),
 		gev.Address(":"+strconv.Itoa(port)),
-		gev.NumLoops(loops),
-	)
+		gev.NumLoops(loops))
 	if err != nil {
 		panic(err)
 	}

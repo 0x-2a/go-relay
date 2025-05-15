@@ -1,8 +1,8 @@
 package conf
 
 const (
-	ReadBufferSize  = 4096
-	WriteBufferSize = 4096
+	ReadBufferSize  = 0
+	WriteBufferSize = 0
 	MessageChanSize = 2048
 
 	SenderThrottleMillis = 20
@@ -11,7 +11,7 @@ const (
 	PayloadMinBytes = 2 // must be less than max
 	PayloadMaxBytes = 4096
 
-	IgnoreInitialMessageCount = 200
+	IgnoreInitialMessageCount = 100
 
 	TimestampBytes = 8
 
